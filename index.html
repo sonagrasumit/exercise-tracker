@@ -2,9 +2,23 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
 <title>Exercise Tracker</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0e1117;font-family:'Inter',system-ui,-apple-system,sans-serif}input[type=number]::-webkit-inner-spin-button{opacity:1}</style>
+<meta name="theme-color" content="#0e1117"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0e1117;font-family:'Inter',system-ui,-apple-system,sans-serif;-webkit-text-size-adjust:100%;padding-bottom:env(safe-area-inset-bottom,0)}
+input[type=number]::-webkit-inner-spin-button{opacity:1}
+input,button{font-size:16px}
+button{-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+@media(max-width:380px){
+  .pill-grid{gap:4px!important}
+  .pill-grid>div{min-width:36px!important;height:34px!important;font-size:9px!important}
+}
+@media(min-width:600px){
+  #root>div{border-left:1px solid #2a3040;border-right:1px solid #2a3040}
+}
+</style>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.6/babel.min.js"></script>
@@ -85,8 +99,23 @@ function scheduleLabel(s){
   return"Every day";
 }
 
-async function syncToSheets(url,data){if(!url)return;try{await fetch(url,{method:"POST",mode:"no-cors",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save",data})})}catch(e){console.warn("Sync fail",e)}}
-async function loadFromSheets(url){if(!url)return null;try{const r=await fetch(url+"?action=load");if(!r.ok)return null;return await r.json()}catch{return null}}
+async function syncToSheets(url,data){
+  if(!url)return;
+  try{
+    // text/plain is CORS-safelisted, survives mode:"no-cors" (application/json gets stripped)
+    await fetch(url,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=UTF-8"},body:JSON.stringify({action:"save",data})});
+  }catch(e){console.warn("Sync fail",e)}
+}
+async function loadFromSheets(url){
+  if(!url)return null;
+  try{
+    // Apps Script redirects; fetch follows by default
+    const r=await fetch(url+"?action=load",{redirect:"follow"});
+    if(!r.ok)return null;
+    const text=await r.text();
+    try{return JSON.parse(text)}catch{return null}
+  }catch{return null}
+}
 
 const defaultData={exercises:[],logs:[],restDays:[]};
 
@@ -194,7 +223,7 @@ function ExerciseCard({ex,data,save,today}){
       </div>
 
       {/* Set pills with individual targets */}
-      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:12,marginTop:10}}>
+      <div className="pill-grid" style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:12,marginTop:10}}>
         {breakdown.map((setTarget,i)=>{
           const v=completedSets[i];
           const cur=i===completedSets.length;
@@ -223,15 +252,62 @@ function ExerciseCard({ex,data,save,today}){
   );
 }
 
-// ═══ TIMER ═══
+// ═══ TIMER (background-safe) ═══
 function TimerControl({target,onLog,setNum}){
-  const[running,setRunning]=useState(false),[elapsed,setElapsed]=useState(0);
-  const iRef=useRef(null),sRef=useRef(null);
-  const start=()=>{setRunning(true);sRef.current=Date.now()-elapsed*1000;iRef.current=setInterval(()=>setElapsed(Math.floor((Date.now()-sRef.current)/1000)),200)};
-  const pause=()=>{setRunning(false);clearInterval(iRef.current)};
-  const reset=()=>{pause();setElapsed(0)};
+  const[running,setRunning]=useState(false);
+  const[elapsed,setElapsed]=useState(0);
+  const startTimeRef=useRef(null); // absolute ms when timer logically started
+  const rafRef=useRef(null);
+
+  const tick=useCallback(()=>{
+    if(startTimeRef.current!=null){
+      setElapsed(Math.floor((Date.now()-startTimeRef.current)/1000));
+    }
+    rafRef.current=requestAnimationFrame(tick);
+  },[]);
+
+  // On visibility change, immediately recalc elapsed from wallclock
+  useEffect(()=>{
+    const onVis=()=>{
+      if(document.visibilityState==="visible"&&startTimeRef.current!=null){
+        setElapsed(Math.floor((Date.now()-startTimeRef.current)/1000));
+      }
+    };
+    document.addEventListener("visibilitychange",onVis);
+    return()=>document.removeEventListener("visibilitychange",onVis);
+  },[]);
+
+  // Cleanup RAF on unmount
+  useEffect(()=>()=>{if(rafRef.current)cancelAnimationFrame(rafRef.current)},[]);
+
+  const start=()=>{
+    const now=Date.now();
+    if(startTimeRef.current==null){
+      // Fresh start or after reset
+      startTimeRef.current=now-elapsed*1000;
+    }
+    setRunning(true);
+    rafRef.current=requestAnimationFrame(tick);
+    // Try wake lock to keep screen on
+    try{navigator.wakeLock?.request("screen").catch(()=>{})}catch{}
+  };
+
+  const pause=()=>{
+    setRunning(false);
+    if(rafRef.current){cancelAnimationFrame(rafRef.current);rafRef.current=null}
+    // Snapshot elapsed from wallclock so resume is exact
+    if(startTimeRef.current!=null){
+      setElapsed(Math.floor((Date.now()-startTimeRef.current)/1000));
+    }
+  };
+
+  const reset=()=>{
+    pause();
+    setElapsed(0);
+    startTimeRef.current=null;
+  };
+
   const logIt=s=>{onLog(s);reset()};
-  useEffect(()=>()=>clearInterval(iRef.current),[]);
   const pct=Math.min(100,elapsed/target*100),over=elapsed>=target;
 
   return(
@@ -242,7 +318,7 @@ function TimerControl({target,onLog,setNum}){
         <span style={{fontSize:28,fontWeight:700,fontVariantNumeric:"tabular-nums",color:over?C.green:C.text,minWidth:90}}>{fmtSec(elapsed)}</span>
         <span style={{fontSize:12,color:C.textMuted}}>/ {fmtSec(target)}</span>
       </div>
-      <div style={{display:"flex",gap:8}}>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
         {!running?<Btn color={C.accent} onClick={start} flex>{elapsed>0?"Resume":"Start"}</Btn>:<Btn color={C.orange} onClick={pause} flex>Pause</Btn>}
         {elapsed>0&&!running&&<><Btn color={C.green} onClick={()=>logIt(elapsed)}>Log {fmtSec(elapsed)}</Btn><Btn color={C.textMuted} onClick={reset} outline>Reset</Btn></>}
       </div>
@@ -257,7 +333,7 @@ function RepsControl({target,onLog,setNum}){
   const reset=()=>{setCounting(false);setCount(0)};
   const logIt=v=>{onLog(v);reset()};
   if(!counting)return<div><div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>Set {setNum} → {target} reps</div><div style={{display:"flex",gap:8}}><Btn color={C.accent} onClick={()=>logIt(target)} flex>Log {target} reps</Btn><Btn color={C.textDim} onClick={()=>{setCount(0);setCounting(true)}} outline>Count</Btn></div></div>;
-  const cbs={width:48,height:48,borderRadius:24,border:`2px solid ${C.border}`,background:C.card,color:C.text,fontSize:22,fontWeight:600,cursor:"pointer",fontFamily:F,display:"flex",alignItems:"center",justifyContent:"center"};
+  const cbs={width:52,height:52,borderRadius:26,border:`2px solid ${C.border}`,background:C.card,color:C.text,fontSize:24,fontWeight:600,cursor:"pointer",fontFamily:F,display:"flex",alignItems:"center",justifyContent:"center",WebkitTapHighlightColor:"transparent"};
   return(
     <div>
       <div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>Set {setNum} → {target} reps</div>
@@ -370,10 +446,10 @@ function AddExerciseView({data,save,existing,onDone}){
 
       <div style={{marginBottom:16}}><div style={lb}>Type</div><div style={{display:"flex",gap:8}}>{[["reps","Reps × Sets"],["time","Time × Sets"]].map(([t,l])=><ToggleBtn key={t} active={type===t} onClick={()=>setType(t)}>{l}</ToggleBtn>)}</div></div>
 
-      <div style={{display:"flex",gap:12,marginBottom:16}}>
-        <div style={{flex:1}}><div style={lb}>{type==="reps"?"Reps / set":"Seconds / set"}</div><input type="number" value={baseValue} onChange={e=>setBV(e.target.value)} placeholder={type==="reps"?"10":"30"} style={ist}/></div>
-        <div style={{flex:1}}><div style={lb}>Sets</div><input type="number" value={sets} onChange={e=>setSets(e.target.value)} placeholder="3" style={ist}/></div>
-        <div style={{flex:1}}><div style={lb}>Max / set</div><input type="number" value={maxPerSet} onChange={e=>setMax(e.target.value)} placeholder="No cap" style={ist}/></div>
+      <div style={{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+        <div style={{flex:"1 1 80px",minWidth:80}}><div style={lb}>{type==="reps"?"Reps / set":"Seconds / set"}</div><input type="number" value={baseValue} onChange={e=>setBV(e.target.value)} placeholder={type==="reps"?"10":"30"} style={ist}/></div>
+        <div style={{flex:"1 1 80px",minWidth:80}}><div style={lb}>Sets</div><input type="number" value={sets} onChange={e=>setSets(e.target.value)} placeholder="3" style={ist}/></div>
+        <div style={{flex:"1 1 80px",minWidth:80}}><div style={lb}>Max / set</div><input type="number" value={maxPerSet} onChange={e=>setMax(e.target.value)} placeholder="No cap" style={ist}/></div>
       </div>
 
       {/* Schedule */}
@@ -459,8 +535,21 @@ function HistoryView({data,save}){
 
 // ═══ SETTINGS ═══
 function SettingsView({sheetsUrl,setSheetsUrl,data,save}){
-  const[url,setUrl]=useState(sheetsUrl),[saved,setSaved]=useState(false);
+  const[url,setUrl]=useState(sheetsUrl),[saved,setSaved]=useState(false),[testResult,setTestResult]=useState(null);
   const saveUrl=async()=>{setSheetsUrl(url);try{STO.set(SHEETS_URL_KEY,url)}catch{}setSaved(true);setTimeout(()=>setSaved(false),2000);if(url)syncToSheets(url,data)};
+  const testConn=async()=>{
+    setTestResult("testing");
+    try{
+      // Test write
+      await syncToSheets(url,data);
+      // Test read (small delay for Apps Script to process)
+      await new Promise(r=>setTimeout(r,1500));
+      const result=await loadFromSheets(url);
+      if(result&&result.exercises!==undefined){setTestResult("ok")}
+      else{setTestResult("read_fail")}
+    }catch{setTestResult("fail")}
+    setTimeout(()=>setTestResult(null),4000);
+  };
   const exportData=()=>{const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}));a.download="exercise-data.json";a.click()};
 
   const ist={width:"100%",padding:"10px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:C.bg,color:C.text,fontSize:14,fontFamily:F,boxSizing:"border-box"};
@@ -473,7 +562,20 @@ function SettingsView({sheetsUrl,setSheetsUrl,data,save}){
         <div style={lb}>Google Sheets Sync</div>
         <div style={{fontSize:12,color:C.textDim,marginBottom:10}}>Paste your Apps Script web app URL.</div>
         <input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://script.google.com/macros/s/…/exec" style={ist}/>
-        <div style={{display:"flex",gap:8,marginTop:10}}><Btn color={C.accent} onClick={saveUrl}>{saved?"Saved ✓":"Save URL"}</Btn>{sheetsUrl&&<Btn color={C.green} onClick={()=>syncToSheets(sheetsUrl,data)} outline>Sync now</Btn>}</div>
+        <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}>
+          <Btn color={C.accent} onClick={saveUrl}>{saved?"Saved ✓":"Save URL"}</Btn>
+          {url&&<Btn color={C.orange} onClick={testConn} outline>{testResult==="testing"?"Testing…":"Test connection"}</Btn>}
+          {sheetsUrl&&<Btn color={C.green} onClick={()=>syncToSheets(sheetsUrl,data)} outline>Sync now</Btn>}
+        </div>
+        {testResult&&testResult!=="testing"&&(
+          <div style={{marginTop:8,fontSize:12,padding:"8px 12px",borderRadius:8,
+            background:testResult==="ok"?C.greenDim:C.redDim,
+            color:testResult==="ok"?C.green:C.red}}>
+            {testResult==="ok"?"✓ Connection works — data synced and verified."
+            :testResult==="read_fail"?"⚠ Write sent but read failed. Check: Deploy → Access = 'Anyone', not 'Anyone with Google account'."
+            :"✕ Connection failed. Check the URL is a deployed Apps Script web app URL."}
+          </div>
+        )}
       </div>
       <div style={{background:C.card,borderRadius:10,padding:14,border:`1px solid ${C.border}`,marginBottom:16}}>
         <div style={lb}>Data</div>
@@ -481,22 +583,33 @@ function SettingsView({sheetsUrl,setSheetsUrl,data,save}){
       </div>
       <div style={{background:C.card,borderRadius:10,padding:14,border:`1px solid ${C.border}`}}>
         <div style={lb}>Apps Script Code</div>
-        <div style={{fontSize:11,color:C.textDim,marginBottom:8}}>Google Sheet → Extensions → Apps Script → paste → Deploy as Web App (access: Anyone)</div>
+        <div style={{fontSize:11,color:C.textDim,marginBottom:8}}>1. New Google Sheet → Extensions → Apps Script<br/>2. Delete all existing code, paste the below<br/>3. Click Deploy → New deployment<br/>4. Type = Web app, Execute as = Me, Access = Anyone<br/>5. Click Deploy, authorize, copy the URL<br/>6. Paste URL above and hit Save<br/>7. <strong style={{color:C.orange}}>Important:</strong> if you edit the script later, you must create a New deployment (not just save)</div>
         <pre style={{background:C.bg,borderRadius:8,padding:12,fontSize:10,fontFamily:"monospace",color:C.textDim,whiteSpace:"pre-wrap",overflowX:"auto",lineHeight:1.5}}>{`function doGet(e) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Data");
+  var sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getSheetByName("Data");
   if (!sheet) return json({});
   var val = sheet.getRange("A1").getValue();
   return json(val ? JSON.parse(val) : {});
 }
+
 function doPost(e) {
-  var body = JSON.parse(e.postData.contents);
+  var raw = e.postData.contents;
+  var body = JSON.parse(raw);
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName("Data") || ss.insertSheet("Data");
-  sheet.getRange("A1").setValue(JSON.stringify(body.data));
+  var sheet = ss.getSheetByName("Data");
+  if (!sheet) sheet = ss.insertSheet("Data");
+  sheet.getRange("A1")
+    .setValue(JSON.stringify(body.data));
+  // Log timestamp in B1 for debugging
+  sheet.getRange("B1")
+    .setValue(new Date().toISOString());
   return json({ ok: true });
 }
+
 function json(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj))
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
 }`}</pre>
       </div>
